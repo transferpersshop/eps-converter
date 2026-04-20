@@ -53,36 +53,52 @@ app.post('/convert', upload.single('file'), async (req, res) => {
   try {
     fs.writeFileSync(inputPath, req.file.buffer);
 
-    const gsArgs = format === 'png'
-      ? [
-          '-sDEVICE=png16malpha',  // PNG with alpha transparency
-          '-r300',                  // 300 DPI
+    if (format === 'png') {
+      // Direct EPS → PNG via Ghostscript
+      await new Promise((resolve, reject) => {
+        execFile('gs', [
+          '-sDEVICE=png16malpha',
+          '-r300',
           '-dEPSCrop',
           '-dBATCH', '-dNOPAUSE', '-dNOSAFER',
           '-dTextAlphaBits=4',
           '-dGraphicsAlphaBits=4',
           `-sOutputFile=${outputPath}`,
           inputPath
-        ]
-      : [
-          '-sDEVICE=svg',           // SVG vector output
-          '-dEPSCrop',              // Crop to bounding box
-          '-dBATCH', '-dNOPAUSE', '-dNOSAFER',
-          '-dNoOutputFonts',        // Convert text to paths (more portable)
-          `-sOutputFile=${outputPath}`,
-          inputPath
-        ];
-
-    await new Promise((resolve, reject) => {
-      execFile('gs', gsArgs, { timeout: 30000 }, (err, stdout, stderr) => {
-        if (err) {
-          console.error('Ghostscript error:', stderr || err.message);
-          reject(new Error(stderr || err.message));
-        } else {
-          resolve();
-        }
+        ], { timeout: 30000 }, (err, stdout, stderr) => {
+          if (err) reject(new Error(stderr || err.message));
+          else resolve();
+        });
       });
-    });
+    } else {
+      // EPS → PDF → SVG (two-step, most reliable)
+      const pdfPath = path.join(tmpDir, `${id}.pdf`);
+      try {
+        // Step 1: EPS → PDF via Ghostscript
+        await new Promise((resolve, reject) => {
+          execFile('gs', [
+            '-sDEVICE=pdfwrite',
+            '-dEPSCrop',
+            '-dBATCH', '-dNOPAUSE', '-dNOSAFER',
+            '-dCompatibilityLevel=1.5',
+            `-sOutputFile=${pdfPath}`,
+            inputPath
+          ], { timeout: 30000 }, (err, stdout, stderr) => {
+            if (err) reject(new Error(stderr || err.message));
+            else resolve();
+          });
+        });
+        // Step 2: PDF → SVG via pdf2svg
+        await new Promise((resolve, reject) => {
+          execFile('pdf2svg', [pdfPath, outputPath], { timeout: 15000 }, (err, stdout, stderr) => {
+            if (err) reject(new Error(stderr || err.message));
+            else resolve();
+          });
+        });
+      } finally {
+        try { fs.unlinkSync(pdfPath); } catch (e) {}
+      }
+    }
 
     if (!fs.existsSync(outputPath)) {
       return res.status(500).json({ error: 'Ghostscript produced no output.' });
